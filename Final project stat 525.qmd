@@ -1,0 +1,627 @@
+---
+title: "Final Stat 525 Use Bayesian Autoregressive(1) to predict cripto, BTC and DOGE as example"
+format: html
+editor: visual
+---
+
+In this project, I will use Bayesian autoregressive model to predict the future price of to cryptocurrency. The data is from yahoo finance.
+
+## data
+ 
+```{r}
+library(quantmod)
+library(ggplot2)
+```
+
+```{r}
+# Define the date range
+start_date <- as.Date("2024-01-01")
+end_date <- as.Date("2024-11-19")
+
+# Retrieve Bitcoin data
+btc_data <- getSymbols("BTC-USD", src = "yahoo", from = start_date, to = end_date, auto.assign = FALSE)
+
+# Retrieve Dogecoin data
+doge_data <- getSymbols("DOGE-USD", src = "yahoo", from = start_date, to = end_date, auto.assign = FALSE)
+
+btc_adjusted <- Ad(btc_data)
+doge_adjusted <- Ad(doge_data)
+
+combined_data <- merge(btc_adjusted, doge_adjusted, all = TRUE)
+
+colnames(combined_data) <- c("BTC_Adjusted", "DOGE_Adjusted")
+
+# Convert the xts object to a data frame
+combined_df <- data.frame(Date = index(combined_data), coredata(combined_data))
+
+head(combined_df)
+```
+
+Here are plots of histroical price of Bitcoin and Dogecoin from Jan 1, 2024 to Nov 2024. They are the data used in the analysis.
+
+
+```{r}
+plot(combined_df$Date,combined_df$BTC_Adjusted, type = "l", col="lightblue", xlab= "Date", ylab="BTC Price", main= "BTC Price")
+plot(combined_df$Date,combined_df$DOGE_Adjusted, type = "l", col="navy", xlab= "Date", ylab="Doge Price", main="DOGE price")
+
+```
+
+
+First we do analysis to Bitcoin.
+
+## AR(1) for Bitcoin
+
+### with weak prior
+
+```{r}
+library(rstan)
+
+adjusted_prices <- combined_df$BTC_Adjusted
+
+#adjusted_prices <- scale(adjusted_prices)
+
+# Define the AR(1) model in Stan
+ar1_model <- "
+data {
+  int<lower=1> T; // Number of time points
+  vector[T] y;    // Observed data
+}
+parameters {
+  real phi;       // AR(1) coefficient
+  real<lower=0> sigma; // Noise standard deviation
+  real mu;        // Mean level
+}
+model {
+  // Priors
+  phi ~ normal(0.8, 0.2);
+  sigma ~ normal(1500, 500);
+  mu ~ normal(61850, 9709);
+
+  // Likelihood
+  y[1] ~ normal(mu, sigma);
+  for (t in 2:T) {
+    y[t] ~ normal(mu + phi * (y[t-1] - mu), sigma);
+  }
+}
+"
+
+# Prepare the data for Stan
+stan_data <- list(
+  T = length(adjusted_prices),
+  y = as.vector(adjusted_prices)
+)
+
+# Fit the model using Stan
+fit <- stan(
+  model_code = ar1_model,
+  data = stan_data,
+  iter = 2000,     # Number of iterations
+  chains = 4,      # Number of chains
+  warmup = 500,    # Warm-up iterations
+  thin = 1,        # Thinning interval
+  seed = 2024       # Random seed for reproducibility
+)
+
+# Print the summary of the fit
+print(fit, digits = 2)
+
+# Plot the posterior distributions
+stan_plot(fit)
+
+# Traceplot for diagnostic
+traceplot(fit)
+
+# Extract posterior samples
+posterior_samples <- extract(fit)
+
+# Summary of phi
+phi_posterior <- posterior_samples$phi
+cat("Posterior mean of phi:", mean(phi_posterior), "\n")
+
+```
+
+
+```{r}
+# Extract posterior samples
+posterior_samples <- extract(fit)
+phi_samples <- posterior_samples$phi
+mu_samples <- posterior_samples$mu
+sigma_samples <- posterior_samples$sigma
+
+# Use the last observed adjusted price as the initial value
+last_observed <- tail(adjusted_prices, 1)
+
+# Number of steps to predict
+n <- 15  # Adjust to desired forecast horizon
+
+# Number of posterior draws
+n_draws <- length(phi_samples)
+
+# Matrix to store predictions (rows: posterior samples, columns: future steps)
+predictions <- matrix(NA, nrow = n_draws, ncol = n)
+
+# Simulate future prices
+for (i in 1:n_draws) {
+  current_price <- last_observed
+  for (t in 1:n) {
+    # AR(1) equation
+    epsilon <- rnorm(1, mean = 0, sd = sigma_samples[i])
+    next_price <- mu_samples[i] + phi_samples[i] * (current_price - mu_samples[i]) + epsilon
+    predictions[i, t] <- next_price
+    current_price <- next_price
+  }
+}
+
+# Compute summary statistics for predictions
+mean_predictions <- apply(predictions, 2, mean)
+lower_ci <- apply(predictions, 2, quantile, probs = 0.025)
+upper_ci <- apply(predictions, 2, quantile, probs = 0.975)
+
+# Create a data frame for plotting
+time <- seq(1, n)
+prediction_df <- data.frame(
+  Time = time,
+  Mean = mean_predictions,
+  Lower = lower_ci,
+  Upper = upper_ci
+)
+
+
+ggplot(prediction_df, aes(x = Time)) +
+  geom_line(aes(y = Mean), color = "blue") +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.2, fill = "blue") +
+  labs(title = "Bitcoin Price Forecast",
+       x = "Time Steps",
+       y = "Predicted Price") +
+  theme_minimal()
+
+```
+```{r}
+# Create a data frame for predictions
+#time <- seq(1, n)  # Time steps
+#prediction_df_BTC_1 <- data.frame(
+#  Time = time,          # Time step
+#  Mean = mean_predictions,  # Mean prediction for each time step
+#  Lower = lower_ci,         # Lower bound of the 95% CI
+#  Upper = upper_ci          # Upper bound of the 95% CI
+#)
+
+# Save this data frame for later use
+#saveRDS(prediction_df_BTC_1, file = "predicted_values_with_ci_BTC_1.rds")
+
+#prediction_df_BTC_1 <- readRDS("predicted_values_with_ci_BTC_1.rds")
+
+# Export as CSV
+#write.csv(prediction_df_BTC_1, file = "predicted_values_with_ci_BTC_1.csv", row.names = FALSE)
+
+```
+
+
+### use a strong prior
+
+Here we assume higher future price. So, the prior is different. The $\mu \sim N(100000, 5000)$, which 100000 indicates high confiendence of its boom.
+
+```{r}
+
+ar1_model <- "
+data {
+  int<lower=1> T; // Number of time points
+  vector[T] y;    // Observed data
+}
+parameters {
+  real phi;       // AR(1) coefficient
+  real<lower=0> sigma; // Noise standard deviation
+  real mu;        // Mean level
+}
+model {
+  // Strong Priors
+  phi ~ normal(0.95, 0.05);  // Strong belief that phi is near 0.95
+  sigma ~ gamma(100,100);    
+  mu ~ normal(100000, 5000);       
+
+  // Likelihood
+  y[1] ~ normal(mu, sigma);
+  for (t in 2:T) {
+    y[t] ~ normal(mu + phi * (y[t-1] - mu), sigma);
+  }
+}
+"
+
+
+
+stan_data <- list(
+  T = length(adjusted_prices),
+  y = as.vector(adjusted_prices)
+)
+
+# Fit the model using Stan
+fit <- stan(
+  model_code = ar1_model,
+  data = stan_data,
+  iter = 2000,     # Number of iterations
+  chains = 4,      # Number of chains
+  warmup = 500,    # Warm-up iterations
+  thin = 1,        # Thinning interval
+  seed = 2024       # Random seed for reproducibility
+)
+
+# Print the summary of the fit
+print(fit, digits = 2)
+
+# Plot the posterior distributions
+stan_plot(fit)
+
+# Traceplot for diagnostic
+traceplot(fit)
+
+# Extract posterior samples
+posterior_samples <- extract(fit)
+
+# Summary of phi
+phi_posterior <- posterior_samples$phi
+cat("Posterior mean of phi:", mean(phi_posterior), "\n")
+
+```
+
+
+```{r}
+# Extract posterior samples
+posterior_samples <- extract(fit)
+phi_samples <- posterior_samples$phi
+mu_samples <- posterior_samples$mu
+sigma_samples <- posterior_samples$sigma
+
+# Use the last observed adjusted price as the initial value
+last_observed <- tail(adjusted_prices, 1)
+
+# Number of steps to predict
+n <- 15  # Adjust to desired forecast horizon
+
+# Number of posterior draws
+n_draws <- length(phi_samples)
+
+# Matrix to store predictions (rows: posterior samples, columns: future steps)
+predictions <- matrix(NA, nrow = n_draws, ncol = n)
+
+# Simulate future prices
+for (i in 1:n_draws) {
+  current_price <- last_observed
+  for (t in 1:n) {
+    # AR(1) equation
+    epsilon <- rnorm(1, mean = 0, sd = sigma_samples[i])
+    next_price <- mu_samples[i] + phi_samples[i] * (current_price - mu_samples[i]) + epsilon
+    predictions[i, t] <- next_price
+    current_price <- next_price
+  }
+}
+
+# Compute summary statistics for predictions
+mean_predictions <- apply(predictions, 2, mean)
+lower_ci <- apply(predictions, 2, quantile, probs = 0.025)
+upper_ci <- apply(predictions, 2, quantile, probs = 0.975)
+
+# Create a data frame for plotting
+time <- seq(1, n)
+prediction_df <- data.frame(
+  Time = time,
+  Mean = mean_predictions,
+  Lower = lower_ci,
+  Upper = upper_ci
+)
+
+
+ggplot(prediction_df, aes(x = Time)) +
+  geom_line(aes(y = Mean), color = "blue") +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.2, fill = "blue") +
+  labs(title = "Bitcoin Price Forecast",
+       x = "Time Steps",
+       y = "Predicted Price") +
+  theme_minimal()
+```
+
+```{r}
+# Create a data frame for predictions
+#time <- seq(1, n)  # Time steps
+#prediction_df_BTC_2 <- data.frame(
+ # Time = time,          # Time step
+ # Mean = mean_predictions,  # Mean prediction for each time step
+ # Lower = lower_ci,         # Lower bound of the 95% CI
+ # Upper = upper_ci          # Upper bound of the 95% CI
+#)
+
+# Save this data frame for later use
+#saveRDS(prediction_df_BTC_2, file = "predicted_values_with_ci_BTC_2.rds")
+
+#prediction_df_BTC_2 <- readRDS("predicted_values_with_ci_BTC_2.rds")
+
+# Export as CSV
+#write.csv(prediction_df_BTC_2, file = "predicted_values_with_ci_BTC_2.csv", row.names = FALSE)
+
+```
+
+
+## Doge
+
+
+### weak prior
+
+
+```{r}
+adjusted_prices_doge <- combined_df$DOGE_Adjusted
+
+
+# Define the AR(1) model in Stan
+ar1_model <- "
+data {
+  int<lower=1> T; // Number of time points
+  vector[T] y;    // Observed data
+}
+parameters {
+  real phi;       // AR(1) coefficient
+  real<lower=0> sigma; // Noise standard deviation
+  real mu;        // Mean level
+}
+model {
+  // Priors
+  phi ~ normal(0, 1);
+  sigma ~ normal(0, 1);
+  mu ~ normal(0.134, 0.053);
+
+  // Likelihood
+  y[1] ~ normal(mu, sigma);
+  for (t in 2:T) {
+    y[t] ~ normal(mu + phi * (y[t-1] - mu), sigma);
+  }
+}
+"
+
+# Prepare the data for Stan
+stan_data <- list(
+  T = length(adjusted_prices_doge),
+  y = as.vector(adjusted_prices_doge)
+)
+
+# Fit the model using Stan
+fit <- stan(
+  model_code = ar1_model,
+  data = stan_data,
+  iter = 2000,     # Number of iterations
+  chains = 4,      # Number of chains
+  warmup = 500,    # Warm-up iterations
+  thin = 1,        # Thinning interval
+  seed = 2024       # Random seed for reproducibility
+)
+
+# Print the summary of the fit
+print(fit, digits = 2)
+
+# Plot the posterior distributions
+stan_plot(fit)
+
+# Traceplot for diagnostic
+traceplot(fit)
+
+# Extract posterior samples
+posterior_samples <- extract(fit)
+
+# Summary of phi
+phi_posterior <- posterior_samples$phi
+cat("Posterior mean of phi:", mean(phi_posterior), "\n")
+```
+```{r}
+# Extract posterior samples
+posterior_samples <- extract(fit)
+phi_samples <- posterior_samples$phi
+mu_samples <- posterior_samples$mu
+sigma_samples <- posterior_samples$sigma
+
+# Use the last observed adjusted price as the initial value
+last_observed <- tail(adjusted_prices_doge, 1)
+
+# Number of steps to predict
+n <- 5  # 
+
+# Number of posterior draws
+n_draws <- length(phi_samples)
+
+# Matrix to store predictions (rows: posterior samples, columns: future steps)
+predictions <- matrix(NA, nrow = n_draws, ncol = n)
+
+# Simulate future prices
+for (i in 1:n_draws) {
+  current_price <- last_observed
+  for (t in 1:n) {
+    # AR(1) equation
+    epsilon <- rnorm(1, mean = 0, sd = sigma_samples[i])
+    next_price <- mu_samples[i] + phi_samples[i] * (current_price - mu_samples[i]) + epsilon
+    predictions[i, t] <- next_price
+    current_price <- next_price
+  }
+}
+
+# Compute summary statistics for predictions
+mean_predictions <- apply(predictions, 2, mean)
+lower_ci <- apply(predictions, 2, quantile, probs = 0.025)
+upper_ci <- apply(predictions, 2, quantile, probs = 0.975)
+
+# Create a data frame for plotting
+time <- seq(1, n)
+prediction_df <- data.frame(
+  Time = time,
+  Mean = mean_predictions,
+  Lower = lower_ci,
+  Upper = upper_ci
+)
+
+
+ggplot(prediction_df, aes(x = Time)) +
+  geom_line(aes(y = Mean), color = "blue") +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.2, fill = "blue") +
+  labs(title = "Dogecoin Price Forecast",
+       x = "Time Steps",
+       y = "Predicted Price") +
+  theme_minimal()
+```
+
+```{r}
+# Create a data frame for predictions
+#time <- seq(1, n)  # Time steps
+#prediction_df_DOGE_1 <- data.frame(
+#  Time = time,          # Time step
+#  Mean = mean_predictions,  # Mean prediction for each time step
+#  Lower = lower_ci,         # Lower bound of the 95% CI
+#  Upper = upper_ci          # Upper bound of the 95% CI
+#)
+
+# Save this data frame for later use
+#saveRDS(prediction_df_DOGE_1, file = "predicted_values_with_ci_DOGE_1.rds")
+
+#prediction_df_DOGE_1 <- readRDS("predicted_values_with_ci_DOGE_1.rds")
+
+# Export as CSV
+#write.csv(prediction_df_DOGE_1, file = "predicted_values_with_ci_DOGE_1.csv", row.names = FALSE)
+
+```
+
+### use strong prior
+
+```{r}
+ar1_model <- "
+data {
+  int<lower=1> T; // Number of time points
+  vector[T] y;    // Observed data
+}
+parameters {
+  real phi;       // AR(1) coefficient
+  real<lower=0> sigma; // Noise standard deviation
+  real mu;        // Mean level
+}
+model {
+  // Priors
+  phi ~ normal(0, 1);
+  sigma ~ normal(0, 1);
+  mu ~ normal(0.4, 0.05);
+
+  // Likelihood
+  y[1] ~ normal(mu, sigma);
+  for (t in 2:T) {
+    y[t] ~ normal(mu + phi * (y[t-1] - mu), sigma);
+  }
+}
+"
+
+# Prepare the data for Stan
+stan_data <- list(
+  T = length(adjusted_prices_doge),
+  y = as.vector(adjusted_prices_doge)
+)
+
+# Fit the model using Stan
+fit <- stan(
+  model_code = ar1_model,
+  data = stan_data,
+  iter = 2000,     # Number of iterations
+  chains = 4,      # Number of chains
+  warmup = 500,    # Warm-up iterations
+  thin = 1,        # Thinning interval
+  seed = 2024       # Random seed for reproducibility
+)
+
+# Print the summary of the fit
+print(fit, digits = 2)
+
+# Plot the posterior distributions
+stan_plot(fit)
+
+# Traceplot for diagnostic
+traceplot(fit)
+
+# Extract posterior samples
+posterior_samples <- extract(fit)
+
+# Summary of phi
+phi_posterior <- posterior_samples$phi
+cat("Posterior mean of phi:", mean(phi_posterior), "\n")
+```
+
+
+```{r}
+# Extract posterior samples
+posterior_samples <- extract(fit)
+phi_samples <- posterior_samples$phi
+mu_samples <- posterior_samples$mu
+sigma_samples <- posterior_samples$sigma
+
+# Use the last observed adjusted price as the initial value
+last_observed <- tail(adjusted_prices_doge, 1)
+
+# Number of steps to predict
+n <- 5  # Adjust to desired forecast horizon
+
+# Number of posterior draws
+n_draws <- length(phi_samples)
+
+# Matrix to store predictions (rows: posterior samples, columns: future steps)
+predictions <- matrix(NA, nrow = n_draws, ncol = n)
+
+# Simulate future prices
+for (i in 1:n_draws) {
+  current_price <- last_observed
+  for (t in 1:n) {
+    # AR(1) equation
+    epsilon <- rnorm(1, mean = 0, sd = sigma_samples[i])
+    next_price <- mu_samples[i] + phi_samples[i] * (current_price - mu_samples[i]) + epsilon
+    predictions[i, t] <- next_price
+    current_price <- next_price
+  }
+}
+
+# Compute summary statistics for predictions
+mean_predictions <- apply(predictions, 2, mean)
+lower_ci <- apply(predictions, 2, quantile, probs = 0.025)
+upper_ci <- apply(predictions, 2, quantile, probs = 0.975)
+
+# Create a data frame for plotting
+time <- seq(1, n)
+prediction_df <- data.frame(
+  Time = time,
+  Mean = mean_predictions,
+  Lower = lower_ci,
+  Upper = upper_ci
+)
+
+
+ggplot(prediction_df, aes(x = Time)) +
+  geom_line(aes(y = Mean), color = "blue") +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.2, fill = "blue") +
+  labs(title = "Dogecoin Price Forecast",
+       x = "Time Steps",
+       y = "Predicted Price") +
+  theme_minimal()
+```
+
+
+```{r}
+# Create a data frame for predictions
+#time <- seq(1, n)  # Time steps
+#prediction_df_DOGE_2 <- data.frame(
+#  Time = time,          # Time step
+#  Mean = mean_predictions,  # Mean prediction for each time step
+#  Lower = lower_ci,         # Lower bound of the 95% CI
+#  Upper = upper_ci          # Upper bound of the 95% CI
+#)
+
+# Save this data frame for later use
+#saveRDS(prediction_df_DOGE_2, file = "predicted_values_with_ci_DOGE_2.rds")
+
+#prediction_df_DOGE_2 <- readRDS("predicted_values_with_ci_DOGE_2.rds")
+
+# Export as CSV
+#write.csv(prediction_df_DOGE_2, file = "predicted_values_with_ci_DOGE_2.csv", row.names = FALSE)
+
+```
+
+
+## something we learn
+
+The results above shows, It is more percise by using stronger prior in prediction.
